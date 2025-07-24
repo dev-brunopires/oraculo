@@ -1,0 +1,18 @@
+/aulas
+/requirements.txt
+/Funções Usuais
+/olds
+/.env
+/oraculo.db
+/uploads/
+# Ignorar ambiente virtual
+venv/
+# Ignorar pastas internas
+oraculo.git/
+# Ignorar caches e binários grandes
+__pycache__/
+*.pyc
+*.sqlite3
+chroma_db/
+.streamlit/
+.devcontainer/
