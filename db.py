@@ -1,76 +1,138 @@
 import os
-import sqlite3
-from datetime import datetime
 from typing import List, Optional, Tuple
 from uuid import uuid4
 
-# Diretório de uploads e banco de dados
-BANCO = "oraculo.db"
+# Tenta acessar st.secrets no Streamlit
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+import socket
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import tuple_row
+
+load_dotenv()
+
+# ------------------ Sanitização e obtenção da URL ------------------
+def _sanitize_neon_url(raw: str) -> str:
+    """
+    - Remove aspas/espacos
+    - Remove channel_binding
+    - Remove ':PORT' inválido no netloc
+    """
+    url = (raw or "").strip().strip('"').strip("'")
+    if not url:
+        return ""
+
+    parts = urlsplit(url)
+    netloc = parts.netloc
+
+    # separa userinfo e host:port
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+    else:
+        userinfo, hostport = "", netloc
+
+    # se houver ':algo' e esse 'algo' não for numérico, remove
+    if ":" in hostport:
+        host, maybe_port = hostport.rsplit(":", 1)
+        if not maybe_port.isdigit():
+            hostport = host  # descarta porta inválida
+    # remonta netloc
+    netloc = f"{userinfo + '@' if userinfo else ''}{hostport}"
+
+    # remove 'channel_binding' do query
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q.pop("channel_binding", None)
+
+    cleaned = parts._replace(netloc=netloc, query=urlencode(q))
+    return urlunsplit(cleaned)
+
+def _get_conn_str() -> str:
+    """
+    Prioridade:
+      1) st.secrets["NEON_DATABASE_URL"] (Streamlit Cloud)
+      2) env var NEON_DATABASE_URL (.env/local)
+    + Sanitiza a URL e valida DNS do host.
+    """
+    url = None
+    if st is not None:
+        try:
+            url = st.secrets.get("NEON_DATABASE_URL", None)
+        except Exception:
+            pass
+    if not url:
+        url = os.getenv("NEON_DATABASE_URL", "")
+
+    url = _sanitize_neon_url(url)
+    if not url:
+        raise RuntimeError("NEON_DATABASE_URL não configurada em st.secrets ou .env")
+
+    # Valida DNS do host (sem acessar parts.port pra não estourar erro)
+    parts = urlsplit(url)
+    host = parts.hostname
+    if not host:
+        raise RuntimeError(f"NEON_DATABASE_URL inválida: {url!r}")
+
+    try:
+        # usa porta padrão 5432 só para teste de resolução
+        socket.getaddrinfo(host, 5432)
+    except Exception as e:
+        raise RuntimeError(
+            f"Não consegui resolver o host '{host}'. "
+            "Confira a URL do Neon (use o endpoint '-pooler') e remova placeholders/linhas extras.\n"
+            f"Erro: {e}"
+        )
+    return url
+
+PG_URL = _get_conn_str()
+
 UPLOAD_DIR = "uploads"
-# Assegura diretório de uploads existe
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ===================== Conexão =====================
-def conectar_banco() -> sqlite3.Connection:
-    """Retorna conexão SQLite para o banco principal."""
-    return sqlite3.connect(BANCO)
+def conectar_banco() -> psycopg.Connection:
+    """Retorna conexão Postgres (Neon)."""
+    return psycopg.connect(PG_URL, row_factory=tuple_row)
 
-# ===================== Inicialização com FTS5 =====================
+# ===================== Inicialização com FTS (Postgres) =====================
 def inicializa_banco():
     """
-    Cria tabelas base e índice FTS5 para buscas full-text.
-    Não destrói dados existentes.
+    Cria tabelas e FTS (tsvector + GIN) no Postgres.
     """
-    conn = conectar_banco()
-    c = conn.cursor()
-
-    # Metadados de arquivos
-    c.execute("""
+    with conectar_banco() as conn, conn.cursor() as c:
+        c.execute("""
         CREATE TABLE IF NOT EXISTS biblioteca (
-            id TEXT PRIMARY KEY,
+            id UUID PRIMARY KEY,
             titulo TEXT NOT NULL,
             descricao TEXT,
             tag TEXT,
             arquivo TEXT NOT NULL,
-            data_envio TEXT NOT NULL
-        )
-    """)
-
-    # Conteúdo extraído
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS biblioteca_text (
-            id TEXT PRIMARY KEY,
-            conteudo TEXT NOT NULL,
-            FOREIGN KEY(id) REFERENCES biblioteca(id)
-        )
-    """)
-
-    # Índice full-text
-    c.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS biblioteca_fts
-        USING fts5(
-            id UNINDEXED,
-            conteudo,
-            titulo,
-            descricao
+            data_envio TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-    """)
-
-    # Conversas
-    c.execute("""
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS biblioteca_text (
+            id UUID PRIMARY KEY REFERENCES biblioteca(id) ON DELETE CASCADE,
+            conteudo TEXT NOT NULL
+        );
+        """)
+        c.execute("""
         CREATE TABLE IF NOT EXISTS conversas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             usuario TEXT,
             pergunta TEXT,
             resposta TEXT,
-            data TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    # Usuários
-    c.execute("""
+            data TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        c.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
-            id TEXT PRIMARY KEY,
+            id UUID PRIMARY KEY,
             nome_completo TEXT NOT NULL,
             cargo TEXT,
             setor TEXT,
@@ -80,230 +142,242 @@ def inicializa_banco():
             data_admissao TEXT,
             tipo_contrato TEXT,
             unidade TEXT,
-            senha_hash TEXT NOT NULL,
+            senha_hash BYTEA NOT NULL,
             perfil TEXT DEFAULT 'usuario',
             status TEXT DEFAULT 'pendente',
             ultimo_acesso TEXT
-        )
-    """)
+        );
+        """)
+        # ---------- FTS ----------
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS biblioteca_fts (
+            id UUID PRIMARY KEY REFERENCES biblioteca(id) ON DELETE CASCADE,
+            doc tsvector
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_biblioteca_fts_doc ON biblioteca_fts USING GIN (doc);")
+        # ---------- FTS: tabela e índice ----------
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS biblioteca_fts (
+            id UUID PRIMARY KEY REFERENCES biblioteca(id) ON DELETE CASCADE,
+            doc tsvector
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_biblioteca_fts_doc ON biblioteca_fts USING GIN (doc);")
 
-    conn.commit()
-    conn.close()
+        # ---------- PATCH: remove funções/triggers antigos ----------
+        c.execute("DROP TRIGGER IF EXISTS trg_bibtext_update ON biblioteca_text;")
+        c.execute("DROP TRIGGER IF EXISTS trg_bib_insert ON biblioteca;")
+        c.execute("DROP TRIGGER IF EXISTS trg_bibtext_upsert ON biblioteca_text;")
+        c.execute("DROP TRIGGER IF EXISTS trg_bib_upsert ON biblioteca;")
+        c.execute("DROP FUNCTION IF EXISTS biblioteca_fts_update();")
+        c.execute("DROP FUNCTION IF EXISTS biblioteca_fts_seed();")
+        c.execute("DROP FUNCTION IF EXISTS biblioteca_fts_upsert();")
+
+        # ---------- Função única com UPSERT idempotente ----------
+        c.execute("""
+        CREATE OR REPLACE FUNCTION biblioteca_fts_upsert() RETURNS trigger AS $$
+        DECLARE
+          v_conteudo  text := '';
+          v_titulo    text := '';
+          v_descricao text := '';
+        BEGIN
+          SELECT COALESCE(bt.conteudo,''), COALESCE(b.titulo,''), COALESCE(b.descricao,'')
+            INTO v_conteudo, v_titulo, v_descricao
+            FROM biblioteca b
+            LEFT JOIN biblioteca_text bt ON bt.id = b.id
+           WHERE b.id = NEW.id;
+
+          INSERT INTO biblioteca_fts (id, doc)
+               VALUES (NEW.id,
+                       setweight(to_tsvector('portuguese', v_conteudo), 'A')
+                    || setweight(to_tsvector('portuguese', v_titulo),   'B')
+                    || setweight(to_tsvector('portuguese', v_descricao),'C'))
+          ON CONFLICT (id) DO UPDATE
+                SET doc = EXCLUDED.doc;
+
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """)
+
+        # ---------- Triggers: ambos chamam a mesma função ----------
+        c.execute("""
+        CREATE TRIGGER trg_bibtext_upsert
+        AFTER INSERT OR UPDATE ON biblioteca_text
+        FOR EACH ROW
+        EXECUTE FUNCTION biblioteca_fts_upsert();
+        """)
+        c.execute("""
+        CREATE TRIGGER trg_bib_upsert
+        AFTER INSERT OR UPDATE ON biblioteca
+        FOR EACH ROW
+        EXECUTE FUNCTION biblioteca_fts_upsert();
+        """)
 
 # ===================== Salvar conversa =====================
 def salvar_conversa(usuario: str, pergunta: str, resposta: str):
-    conn = conectar_banco()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO conversas (usuario, pergunta, resposta) VALUES (?, ?, ?)",
-        (usuario, pergunta, resposta)
-    )
-    conn.commit()
-    conn.close()
+    with conectar_banco() as conn, conn.cursor() as c:
+        c.execute(
+            "INSERT INTO conversas (usuario, pergunta, resposta) VALUES (%s, %s, %s)",
+            (usuario, pergunta, resposta)
+        )
+        conn.commit()
 
 # ===================== Extração de texto =====================
 def extract_text_from_file(caminho: str) -> str:
-    """
-    Extrai texto de arquivos suportados e retorna string.
-    Falha silenciosa -> string vazia (para não quebrar o fluxo do upload).
-    """
     ext = os.path.splitext(caminho)[1].lower()
     try:
         if ext == '.pdf':
             from PyPDF2 import PdfReader
             reader = PdfReader(caminho)
             return '\n'.join(page.extract_text() or '' for page in reader.pages)
-
         if ext in ('.txt', '.md'):
             with open(caminho, encoding='utf-8') as f:
                 return f.read()
-
         if ext == '.csv':
             import pandas as pd
             return pd.read_csv(caminho).to_csv(index=False)
-
         if ext in ('.xls', '.xlsx'):
             import pandas as pd
             return pd.read_excel(caminho).to_csv(index=False)
-
         if ext == '.docx':
             from docx import Document
             return '\n'.join(p.text for p in Document(caminho).paragraphs)
-
     except Exception:
         return ''
-
     return ''
 
 # ===================== Helpers FTS =====================
 def _fts_sanitize_query(q: str) -> str:
-    """
-    Sanitiza termo para uso em FTS5 MATCH:
-      - Remove aspas duplas
-      - Envolve em aspas para busca por frase (melhora precisão, evita erro)
-    """
-    if not q:
-        return ""
-    q = q.strip().replace('"', ' ')
-    return f'"{q}"'
-
+    return (q or "").strip()
 
 def upsert_biblioteca_fts(id_: str, conteudo: str, titulo: str, descricao: str):
-    """Remove e reinsere registro no índice FTS5 (uso após editar metadados)."""
-    conn = conectar_banco(); c = conn.cursor()
-    c.execute("DELETE FROM biblioteca_fts WHERE id=?", (id_,))
-    c.execute(
-        "INSERT INTO biblioteca_fts (id, conteudo, titulo, descricao) VALUES (?, ?, ?, ?)",
-        (id_, conteudo, titulo, descricao)
-    )
-    conn.commit(); conn.close()
+    with conectar_banco() as conn, conn.cursor() as c:
+        c.execute("SELECT biblioteca_fts_update();")
+        conn.commit()
 
 # ===================== Registrar arquivo e indexar =====================
 def registrar_arquivo(id_: str, titulo: str, descricao: str, tag: str, buffer):
-    """
-    Salva arquivo, insere metadados, extrai conteúdo e popula FTS5.
-    Chamador deve gerar o id_ (uuid4 no biblioteca.py).
-    """
     nome = f"{uuid4()}_{buffer.name}"
     caminho = os.path.join(UPLOAD_DIR, nome)
     with open(caminho, 'wb') as f:
         f.write(buffer.read())
-
     conteudo = extract_text_from_file(caminho)
 
-    conn = conectar_banco(); c = conn.cursor()
-    # metadados
-    c.execute(
-        "INSERT INTO biblioteca (id, titulo, descricao, tag, arquivo, data_envio) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-        (id_, titulo, descricao, tag, nome)
-    )
-    # conteúdo extraído
-    c.execute(
-        "INSERT INTO biblioteca_text (id, conteudo) VALUES (?, ?)",
-        (id_, conteudo)
-    )
-    # indexação FTS5
-    c.execute(
-        "INSERT INTO biblioteca_fts (id, conteudo, titulo, descricao) VALUES (?, ?, ?, ?)",
-        (id_, conteudo, titulo, descricao)
-    )
-    conn.commit(); conn.close()
+    with conectar_banco() as conn, conn.cursor() as c:
+        c.execute(
+            "INSERT INTO biblioteca (id, titulo, descricao, tag, arquivo) VALUES (%s, %s, %s, %s, %s)",
+            (id_, titulo, descricao, tag, nome)
+        )
+        c.execute(
+            "INSERT INTO biblioteca_text (id, conteudo) VALUES (%s, %s)",
+            (id_, conteudo)
+        )
+        conn.commit()
 
 # ===================== Buscar procedimentos =====================
 def buscar_procedimentos(
     query: Optional[str] = None,
     top_k: int = 5,
     truncate_chars: Optional[int] = None,
-    mode: str = "full",              # "full" | "desc" | "mixed"
-    fallback_chars: int = 2000,       # usado p/ mode="desc"/"mixed"
+    mode: str = "full",
+    fallback_chars: int = 2000,
 ) -> List[Tuple[str, str]]:
-    """Recupera procedimentos para o agente.
+    with conectar_banco() as conn, conn.cursor() as c:
+        rows: list[tuple] = []
 
-    Quando *query* é fornecida: faz busca FTS5 em (conteudo, titulo, descricao).
-    Sem *query*: retorna últimos *top_k* por data_envio.
-
-    *mode* controla o texto retornado:
-      - "full": usa conteúdo integral (respeitando *truncate_chars* se dado).
-      - "desc": usa apenas a descrição; se vazia -> primeiros *fallback_chars* do conteúdo.
-      - "mixed": usa descrição + duas quebras de linha + primeiro *fallback_chars* do conteúdo.
-
-    Retorna lista [(titulo, texto_para_prompt)].
-    """
-    conn = conectar_banco(); c = conn.cursor()
-
-    if query:
-        q = _fts_sanitize_query(query)
-        sql = (
-            "SELECT b.titulo, b.descricao, bt.conteudo "
-            "FROM biblioteca_fts AS fts "
-            "JOIN biblioteca      AS b  ON fts.id = b.id "
-            "JOIN biblioteca_text AS bt ON b.id = bt.id "
-            "WHERE fts MATCH ? "
-            "ORDER BY b.data_envio DESC LIMIT ?"
-        )
-        try:
-            c.execute(sql, (q, top_k))
-        except sqlite3.OperationalError:
-            # fallback super defensivo: lista por data sem filtro
+        if query:
+            q = _fts_sanitize_query(query)
             c.execute(
-                "SELECT b.titulo, b.descricao, bt.conteudo FROM biblioteca b JOIN biblioteca_text bt ON b.id = bt.id ORDER BY b.data_envio DESC LIMIT ?",
+                """
+                SELECT b.titulo, b.descricao, bt.conteudo
+                  FROM biblioteca_fts f
+                  JOIN biblioteca b ON b.id = f.id
+                  JOIN biblioteca_text bt ON bt.id = b.id
+                 WHERE f.doc @@ plainto_tsquery('portuguese', %s)
+                 ORDER BY b.data_envio DESC
+                 LIMIT %s
+                """,
+                (q, top_k)
+            )
+            rows = c.fetchall()
+
+            if not rows:
+                pattern = f"%{q}%"
+                c.execute(
+                    """
+                    SELECT b.titulo, b.descricao, bt.conteudo
+                      FROM biblioteca b
+                      JOIN biblioteca_text bt ON bt.id = b.id
+                     WHERE b.titulo ILIKE %s OR b.descricao ILIKE %s OR bt.conteudo ILIKE %s
+                     ORDER BY b.data_envio DESC
+                     LIMIT %s
+                    """,
+                    (pattern, pattern, pattern, top_k)
+                )
+                rows = c.fetchall()
+        else:
+            c.execute(
+                """
+                SELECT b.titulo, b.descricao, bt.conteudo
+                  FROM biblioteca b
+                  JOIN biblioteca_text bt ON bt.id = b.id
+                 ORDER BY b.data_envio DESC
+                 LIMIT %s
+                """,
                 (top_k,)
             )
-    else:
-        c.execute(
-            "SELECT b.titulo, b.descricao, bt.conteudo FROM biblioteca b JOIN biblioteca_text bt ON b.id = bt.id ORDER BY b.data_envio DESC LIMIT ?",
-            (top_k,)
-        )
-
-    rows = c.fetchall(); conn.close()
+            rows = c.fetchall()
 
     out: List[Tuple[str, str]] = []
     mode = (mode or "full").lower()
     for titulo, descricao, conteudo in rows:
-        texto: str
         if mode == "desc":
-            if descricao and descricao.strip():
-                texto = descricao.strip()
-            else:
-                texto = (conteudo or "")[:fallback_chars]
+            texto = (descricao or "").strip() or (conteudo or "")[:fallback_chars]
         elif mode == "mixed":
             desc_part = (descricao or "").strip()
             cont_part = (conteudo or "")[:fallback_chars]
-            if desc_part:
-                texto = desc_part + "\n\n" + cont_part
-            else:
-                texto = cont_part
-        else:  # full (default)
+            texto = desc_part + "\n\n" + cont_part if desc_part else cont_part
+        else:  # full
             texto = conteudo or ""
             if truncate_chars and truncate_chars > 0:
                 texto = texto[:truncate_chars]
         out.append((titulo, texto))
-
     return out
 
 # ===================== Reindex manual (opcional) =====================
 def reindex_biblioteca_from_uploads(default_tag: str = "Outro"):
-    """
-    Reconstrói biblioteca*/biblioteca_fts a partir dos arquivos físicos em uploads/.
-    Use com cuidado: apaga registros atuais dessas tabelas.
-    (Q3: chamada manual)
-    """
-    conn = conectar_banco()
-    c = conn.cursor()
+    with conectar_banco() as conn, conn.cursor() as c:
+        c.execute("DELETE FROM biblioteca_fts;")
+        c.execute("DELETE FROM biblioteca_text;")
+        c.execute("DELETE FROM biblioteca;")
+        conn.commit()
 
-    c.execute("DELETE FROM biblioteca")
-    c.execute("DELETE FROM biblioteca_text")
-    c.execute("DELETE FROM biblioteca_fts")
-    conn.commit()
+        for fname in os.listdir(UPLOAD_DIR):
+            fpath = os.path.join(UPLOAD_DIR, fname)
+            if not os.path.isfile(fpath):
+                continue
+            doc_id = str(uuid4())
+            titulo = os.path.splitext(fname)[0]
+            descricao = ""
+            tag = default_tag
+            conteudo = extract_text_from_file(fpath)
 
-    for fname in os.listdir(UPLOAD_DIR):
-        fpath = os.path.join(UPLOAD_DIR, fname)
-        if not os.path.isfile(fpath):
-            continue
+            with conectar_banco() as conn2, conn2.cursor() as c2:
+                c2.execute(
+                    "INSERT INTO biblioteca (id, titulo, descricao, tag, arquivo) VALUES (%s, %s, %s, %s, %s)",
+                    (doc_id, titulo, descricao, tag, fname)
+                )
+                c2.execute(
+                    "INSERT INTO biblioteca_text (id, conteudo) VALUES (%s, %s)",
+                    (doc_id, conteudo)
+                )
+                conn2.commit()
 
-        doc_id = str(uuid4())
-        titulo = os.path.splitext(fname)[0]
-        descricao = ""
-        tag = default_tag
-        conteudo = extract_text_from_file(fpath)
-
-        c.execute(
-            "INSERT INTO biblioteca (id, titulo, descricao, tag, arquivo, data_envio) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (doc_id, titulo, descricao, tag, fname),
-        )
-        c.execute(
-            "INSERT INTO biblioteca_text (id, conteudo) VALUES (?, ?)",
-            (doc_id, conteudo),
-        )
-        c.execute(
-            "INSERT INTO biblioteca_fts (id, conteudo, titulo, descricao) VALUES (?, ?, ?, ?)",
-            (doc_id, conteudo, titulo, descricao),
-        )
-
-    conn.commit()
-    conn.close()
+        with conectar_banco() as conn3, conn3.cursor() as c3:
+            c3.execute("SELECT biblioteca_fts_update();")
+            conn3.commit()
 
 
 def buscar_procedimentos_prior_descricao(
@@ -312,69 +386,44 @@ def buscar_procedimentos_prior_descricao(
     top_k_full: int = 5,
     truncate_chars: int | None = None,
 ) -> list[tuple[str, str]]:
-    """
-    Estratégia em 2 estágios:
-
-    1) Busca rápida em campos curtos (titulo, descricao) usando FTS5.
-       Retorna até `top_k_descricao` IDs ordenados por data_envio recente.
-    2) Se nada encontrado, cai na busca completa (conteudo + titulo + descricao)
-       retornando até `top_k_full`.
-
-    Retorna lista [(titulo, conteudo), ...].
-    """
     if not query:
-        # Sem query: delega pro buscar_procedimentos padrão (últimos por data)
         return buscar_procedimentos(query=None, top_k=top_k_full, truncate_chars=truncate_chars)
 
     q = _fts_sanitize_query(query)
-    conn = conectar_banco(); c = conn.cursor()
-
-    # --- Estágio 1: FTS só em titulo+descricao ---
-    try:
+    with conectar_banco() as conn, conn.cursor() as c:
         c.execute(
             """
             SELECT b.id, b.titulo
-              FROM biblioteca_fts AS fts
-              JOIN biblioteca AS b ON b.id = fts.id
-             WHERE fts MATCH ?
+              FROM biblioteca b
+              JOIN biblioteca_fts f ON f.id = b.id
+             WHERE setweight(to_tsvector('portuguese', COALESCE(b.titulo,'')), 'A')
+                || setweight(to_tsvector('portuguese', COALESCE(b.descricao,'')), 'B')
+                   @@ plainto_tsquery('portuguese', %s)
              ORDER BY b.data_envio DESC
-             LIMIT ?
+             LIMIT %s
             """,
             (q, top_k_descricao)
         )
         cand_rows = c.fetchall()
-    except sqlite3.OperationalError:
-        # se der erro no parser MATCH, zera candidatos
-        cand_rows = []
 
-    ids_escolhidos = [row[0] for row in cand_rows]
+        ids_escolhidos = [row[0] for row in cand_rows]
 
-    # Se encontramos pelo menos 1 candidato, coleta os textos completos só desses
-    if ids_escolhidos:
-        # usa placeholders variáveis p/ IN
-        ph = ",".join("?" for _ in ids_escolhidos)
-        c.execute(
-            f"""
-            SELECT b.titulo, bt.conteudo
-              FROM biblioteca_text bt
-              JOIN biblioteca b ON b.id = bt.id
-             WHERE bt.id IN ({ph})
-             ORDER BY b.data_envio DESC
-            """,
-            ids_escolhidos
-        )
-        rows = c.fetchall()
-        conn.close()
-    else:
-        # fallback estágio 2: busca completa (conteudo + titulo + descricao)
-        conn.close()
-        rows = buscar_procedimentos(
-            query=query,
-            top_k=top_k_full,
-            truncate_chars=truncate_chars,
-        )
+        if ids_escolhidos:
+            ph = ",".join(["%s"] * len(ids_escolhidos))
+            c.execute(
+                f"""
+                SELECT b.titulo, bt.conteudo
+                  FROM biblioteca_text bt
+                  JOIN biblioteca b ON b.id = bt.id
+                 WHERE bt.id IN ({ph})
+                 ORDER BY b.data_envio DESC
+                """,
+                ids_escolhidos
+            )
+            rows = c.fetchall()
+        else:
+            rows = buscar_procedimentos(query=q, top_k=top_k_full, truncate_chars=truncate_chars)
 
-    # truncamento final
     if truncate_chars and truncate_chars > 0:
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 

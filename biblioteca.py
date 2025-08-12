@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import mimetypes
 import os
-import sqlite3
+from datetime import datetime
 from functools import lru_cache
 from typing import Optional
 from uuid import uuid4
 
 import streamlit as st
 
-from db import conectar_banco, extract_text_from_file
+from db import \
+    extract_text_from_file  # ainda usamos no preview/manual se quiser
+from db import conectar_banco, inicializa_banco, registrar_arquivo
 
 # Caminhos / constantes
-BANCO = "oraculo.db"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -27,39 +28,12 @@ DEFAULT_ICONS = {
 PREVIEW_CHARS = 80
 
 # =========================================================
-# Inicialização defensiva (caso app chame direto a página)
+# Inicialização defensiva (Postgres)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def inicializa_biblioteca() -> bool:
-    conn = conectar_banco(); c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS biblioteca (
-            id TEXT PRIMARY KEY,
-            titulo TEXT NOT NULL,
-            descricao TEXT,
-            tag TEXT,
-            arquivo TEXT NOT NULL,
-            data_envio TEXT NOT NULL
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS biblioteca_text (
-            id TEXT PRIMARY KEY,
-            conteudo TEXT NOT NULL,
-            FOREIGN KEY(id) REFERENCES biblioteca(id)
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE VIRTUAL TABLE IF NOT EXISTS biblioteca_fts
-        USING fts5(id UNINDEXED, conteudo, titulo, descricao);
-        """
-    )
-    conn.commit(); conn.close()
+    # Agora usamos a inicialização do Postgres
+    inicializa_banco()
     return True
 
 
@@ -90,9 +64,15 @@ def _preview(texto: str, n: int = PREVIEW_CHARS) -> str:
     if not texto:
         return "Sem descrição"
     txt = texto.strip().replace("\n", " ")
-    if len(txt) <= n:
-        return txt
-    return txt[: n - 1] + "…"
+    return txt if len(txt) <= n else txt[: n - 1] + "…"
+
+
+def _fmt_data_envio(dt) -> str:
+    if isinstance(dt, datetime):
+        return dt.strftime("%Y-%m-%d")
+    # fallback se vier string (ex.: em dumps antigos)
+    s = str(dt)
+    return s[:10] if len(s) >= 10 else s
 
 
 # =========================================================
@@ -122,27 +102,13 @@ def pagina_biblioteca():
                     st.warning("Preencha título e arquivo.")
                 else:
                     novo_id = str(uuid4())
-                    arquivo_path = os.path.join(UPLOAD_DIR, f"{novo_id}_{arquivo.name}")
-                    with open(arquivo_path, "wb") as f:
-                        f.write(arquivo.read())
-                    texto = extract_text_from_file(arquivo_path)
-                    conn = conectar_banco(); c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO biblioteca (id, titulo, descricao, tag, arquivo, data_envio)"
-                        " VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                        (novo_id, titulo, descricao, tag, os.path.basename(arquivo_path)),
-                    )
-                    c.execute(
-                        "INSERT INTO biblioteca_text (id, conteudo) VALUES (?, ?)",
-                        (novo_id, texto),
-                    )
-                    c.execute(
-                        "INSERT INTO biblioteca_fts (id, conteudo, titulo, descricao) VALUES (?, ?, ?, ?)",
-                        (novo_id, texto, titulo, descricao),
-                    )
-                    conn.commit(); conn.close()
-                    st.success("Material salvo com sucesso!")
-                    st.rerun()
+                    # delega tudo para o db.registrar_arquivo (salva arquivo, extrai texto, insere e indexa)
+                    try:
+                        registrar_arquivo(novo_id, titulo, descricao or "", tag, arquivo)
+                        st.success("Material salvo com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
 
     # -----------------------------------------------------
     # Abas por tag
@@ -171,35 +137,44 @@ def renderizar_lista(prefix: str, filtro_tag: Optional[str] = None):
     limite = 20
     offset = pagina * limite
 
-    sql = (
+    base_sql = (
         "SELECT b.id, b.titulo, b.descricao, b.tag, b.arquivo, b.data_envio "
-        "FROM biblioteca AS b JOIN biblioteca_text AS bt ON b.id = bt.id "
+        "FROM biblioteca AS b "
+        "JOIN biblioteca_text AS bt ON b.id = bt.id "
     )
     filtros_sql = []
     params = []
+
     if filtro_tag:
-        filtros_sql.append("b.tag = ?"); params.append(filtro_tag)
+        filtros_sql.append("b.tag = %s"); params.append(filtro_tag)
     if termo:
-        filtros_sql.append("(b.titulo LIKE ? OR b.descricao LIKE ?)")
-        params.extend([f"%{termo}%"] * 2)
+        filtros_sql.append("(b.titulo ILIKE %s OR b.descricao ILIKE %s)")
+        params.extend([f"%{termo}%", f"%{termo}%"])
+
+    sql = base_sql
     if filtros_sql:
         sql += " WHERE " + " AND ".join(filtros_sql)
-    sql += " ORDER BY b.data_envio DESC LIMIT ? OFFSET ?"
+    sql += " ORDER BY b.data_envio DESC LIMIT %s OFFSET %s"
     params.extend([limite, offset])
 
     conn = conectar_banco(); c = conn.cursor()
     c.execute(sql, params)
     rows = c.fetchall()
 
+    # Fallback FTS se nada encontrado e termo existe
     if termo and not rows:
-        q = termo.replace('"', ' ')
-        fts_sql = (
-            "SELECT b.id, b.titulo, b.descricao, b.tag, b.arquivo, b.data_envio "
-            "FROM biblioteca AS b JOIN biblioteca_text AS bt ON b.id = bt.id "
-            "JOIN biblioteca_fts ON b.id = biblioteca_fts.id "
-            "WHERE biblioteca_fts MATCH ? ORDER BY b.data_envio DESC LIMIT ? OFFSET ?"
+        c.execute(
+            """
+            SELECT b.id, b.titulo, b.descricao, b.tag, b.arquivo, b.data_envio
+              FROM biblioteca AS b
+              JOIN biblioteca_text AS bt ON b.id = bt.id
+              JOIN biblioteca_fts AS f ON b.id = f.id
+             WHERE f.doc @@ plainto_tsquery('portuguese', %s)
+             ORDER BY b.data_envio DESC
+             LIMIT %s OFFSET %s
+            """,
+            (termo, limite, offset)
         )
-        c.execute(fts_sql, (f'"{q}"', limite, offset))
         rows = c.fetchall()
     conn.close()
 
@@ -222,7 +197,7 @@ def renderizar_lista(prefix: str, filtro_tag: Optional[str] = None):
             with c2:
                 icon = DEFAULT_ICONS.get(tag, "📎")
                 st.markdown(f"{icon} **{titulo}**")
-                st.caption(f"{_preview(descricao)} | `{data_envio[:10]}` | 🏷️ {tag}")
+                st.caption(f"{_preview(descricao)} | `{_fmt_data_envio(data_envio)}` | 🏷️ {tag}")
             with c3:
                 bc1, bc2, bc3 = st.columns([1, 1, 1])
                 data_bytes, mime = _load_upload_bytes(arquivo)
@@ -237,24 +212,27 @@ def renderizar_lista(prefix: str, filtro_tag: Optional[str] = None):
                 else:
                     bc2.write(""); bc3.write("")
 
+        # ----- Edição -----
         if edit_id == id_:
             with st.expander("✏️ Editando", expanded=True):
                 with st.form(f"form_edit_{row_prefix}"):
                     novo_titulo = st.text_input("Novo título", value=titulo)
-                    nova_descricao = st.text_area("Nova descrição", value=descricao)
+                    nova_descricao = st.text_area("Nova descrição", value=descricao or "")
                     tags = list(DEFAULT_ICONS.keys())
                     current = tags.index(tag) if tag in tags else tags.index("Outro")
                     nova_tag = st.selectbox("Nova tag", tags, index=current)
                     if st.form_submit_button("Salvar alterações"):
                         conn = conectar_banco(); c = conn.cursor()
-                        c.execute("UPDATE biblioteca SET titulo=?, descricao=?, tag=? WHERE id=?",
-                                  (novo_titulo, nova_descricao, nova_tag, id_))
-                        c.execute("UPDATE biblioteca_fts SET titulo=?, descricao=? WHERE id=?",
-                                  (novo_titulo, nova_descricao, id_))
+                        # atualiza só a tabela principal; triggers recalc FTS
+                        c.execute(
+                            "UPDATE biblioteca SET titulo=%s, descricao=%s, tag=%s WHERE id=%s",
+                            (novo_titulo, nova_descricao, nova_tag, id_)
+                        )
                         conn.commit(); conn.close()
                         st.success("Material atualizado!")
                         st.session_state["editando_id"] = None; st.rerun()
 
+        # ----- Exclusão -----
         if del_id == id_:
             with st.expander("🗑️ Confirmar exclusão?", expanded=True):
                 with st.form(f"form_del_{row_prefix}"):
@@ -265,9 +243,8 @@ def renderizar_lista(prefix: str, filtro_tag: Optional[str] = None):
                     if os.path.exists(caminho):
                         os.remove(caminho)
                     conn = conectar_banco(); c = conn.cursor()
-                    c.execute("DELETE FROM biblioteca WHERE id=?", (id_,))
-                    c.execute("DELETE FROM biblioteca_text WHERE id=?", (id_,))
-                    c.execute("DELETE FROM biblioteca_fts WHERE id=?", (id_,))
+                    # basta deletar da principal; CASCADE remove text/fts
+                    c.execute("DELETE FROM biblioteca WHERE id=%s", (id_,))
                     conn.commit(); conn.close()
                     st.success("Material excluído!")
                     st.session_state["exclusao_id"] = None; st.rerun()
