@@ -123,6 +123,7 @@ def inicializa_banco():
             data_envio TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
+        c.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS foto BYTEA;")
         c.execute("""
         CREATE TABLE IF NOT EXISTS biblioteca_text (
             id UUID PRIMARY KEY REFERENCES biblioteca(id) ON DELETE CASCADE,
@@ -436,6 +437,7 @@ def buscar_procedimentos_prior_descricao(
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 
     return rows
+
 
 
 
