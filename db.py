@@ -12,18 +12,22 @@ import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from psycopg.rows import tuple_row
-
 load_dotenv()
 
-# Fallback: instala psycopg-binary se faltar (apenas no Cloud, temporário)
+# --- Garante psycopg instalado antes de importar submódulos ---
 try:
-    import psycopg  # noqa
+    import psycopg  # v3
 except Exception:
-    import subprocess
-    import sys
+    # fallback (temporário) para o Cloud, caso ignore o requirements
+    import sys, subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg-binary==3.2.1"])
-    import psycopg  # noqa
+    import psycopg
+
+# tuple_row é opcional dependendo do wheel
+try:
+    from psycopg.rows import tuple_row
+except Exception:
+    tuple_row = None
 
 # ------------------ Sanitização e obtenção da URL ------------------
 def _sanitize_neon_url(raw: str) -> str:
@@ -436,3 +440,4 @@ def buscar_procedimentos_prior_descricao(
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 
     return rows
+
