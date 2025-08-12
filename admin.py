@@ -180,18 +180,26 @@ def gerenciar_funcionarios():
     inicializa_funcionarios()
     default_pass = "Palavrapasse@001"
 
+    # estado UI
     if "edit" not in st.session_state:
         st.session_state["edit"] = None
+    if "show_form" not in st.session_state:
+        st.session_state["show_form"] = False
+    if "up" not in st.session_state:
+        st.session_state["up"] = False
 
-    if st.session_state.get("edit"):
+    # se está editando, desvia p/ editor
+    if st.session_state["edit"]:
         editar_funcionario(st.session_state["edit"])
         return
 
+    # ---------- título + botão ----------
     st.markdown("### ➕ Adicionar Funcionários")
-    if st.button("➕ Novo Funcionário"):
-        st.session_state["show_form"] = not st.session_state.get("show_form", False)
+    if st.button("➕ Novo Funcionário", key="btn_novo_func"):
+        st.session_state["show_form"] = not st.session_state["show_form"]
 
-    if st.session_state.get("show_form"):
+    # ---------- formulário novo funcionário ----------
+    if st.session_state["show_form"]:
         with st.form("form_func"):
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -215,27 +223,24 @@ def gerenciar_funcionarios():
             else:
                 func_id = str(uuid4())
 
-                # bytes da foto para usuarios.foto (BYTEA)
+                # opcional: salvar arquivo local (compat) + gravar bytes em usuarios.foto (BYTEA)
                 foto_bytes = None
+                foto_path = ""
                 if foto is not None:
                     foto_bytes = foto.getvalue()
-                    # opcional: ainda salvar no disco, se quiser manter
                     ext = os.path.splitext(foto.name)[1]
                     foto_path = os.path.join(UPLOAD_DIR, f"{func_id}{ext}")
                     with open(foto_path, "wb") as f:
                         f.write(foto_bytes)
-                else:
-                    foto_path = ""
 
                 senha_hash = bcrypt.hashpw(default_pass.encode(), bcrypt.gensalt())
-
                 with conectar_banco() as conn, conn.cursor() as c:
-                    # cria usuário vinculado
+                    # usuário
                     c.execute(
                         """
                         INSERT INTO usuarios
-                        (id, nome_completo, cargo, setor, matricula, email, telefone, data_admissao,
-                         tipo_contrato, unidade, senha_hash, perfil, status, ultimo_acesso, foto)
+                          (id, nome_completo, cargo, setor, matricula, email, telefone,
+                           data_admissao, tipo_contrato, unidade, senha_hash, perfil, status, ultimo_acesso, foto)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'usuario','trocar_senha',%s,%s)
                         """,
                         (
@@ -244,12 +249,12 @@ def gerenciar_funcionarios():
                             datetime.now().isoformat(), foto_bytes
                         )
                     )
-                    # cria funcionário espelho (mantemos foto TEXT por compatibilidade)
+                    # funcionário (espelho)
                     c.execute(
                         """
                         INSERT INTO funcionarios
-                        (id, nome, cargo, setor, matricula, email, telefone, data_admissao,
-                         tipo_contrato, unidade, foto, estrangeiro)
+                          (id, nome, cargo, setor, matricula, email, telefone, data_admissao,
+                           tipo_contrato, unidade, foto, estrangeiro)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
@@ -258,12 +263,11 @@ def gerenciar_funcionarios():
                         )
                     )
                     conn.commit()
-
                 st.success("Funcionário cadastrado e usuário criado com senha padrão!")
-                st.session_state.pop("show_form", None)
+                st.session_state["show_form"] = False
                 st.rerun()
 
-    # Importação/Exportação CSV
+    # ---------- Importação/Exportação CSV ----------
     st.markdown("---")
     st.markdown("### 📂 Importação/Exportação de Funcionários")
     col_export, col_import = st.columns([1, 2])
@@ -275,12 +279,17 @@ def gerenciar_funcionarios():
                 )
                 rows = c.fetchall()
             df = pd.DataFrame(rows, columns=["nome","cargo","setor","matricula","email","telefone","data_admissao","tipo_contrato","unidade"])
-            st.download_button("📁 Baixar lista", data=df.to_csv(index=False).encode("utf-8"),
-                               file_name="funcionarios.csv", mime="text/csv")
+            st.download_button(
+                "📁 Baixar lista",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="funcionarios.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
     with col_import:
         if st.button("📥 Importar CSV"):
             st.session_state["up"] = True
-    if st.session_state.get("up"):
+    if st.session_state["up"]:
         up_file = st.file_uploader("Selecionar arquivo CSV", type=["csv"])
         if up_file:
             df = pd.read_csv(up_file)
@@ -291,7 +300,7 @@ def gerenciar_funcionarios():
                     c.execute(
                         """
                         INSERT INTO funcionarios
-                        (id, nome, cargo, setor, matricula, email, telefone, data_admissao, tipo_contrato, unidade, foto, estrangeiro)
+                          (id, nome, cargo, setor, matricula, email, telefone, data_admissao, tipo_contrato, unidade, foto, estrangeiro)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'',0)
                         """,
                         (
@@ -301,11 +310,12 @@ def gerenciar_funcionarios():
                         )
                     )
                     # usuário espelho
-                    sh = bcrypt.hashpw("Palavrapasse@001".encode(), bcrypt.gensalt())
+                    sh = bcrypt.hashpw(default_pass.encode(), bcrypt.gensalt())
                     c.execute(
                         """
                         INSERT INTO usuarios
-                        (id, nome_completo, cargo, setor, matricula, email, telefone, data_admissao, tipo_contrato, unidade, senha_hash, perfil, status, ultimo_acesso, foto)
+                          (id, nome_completo, cargo, setor, matricula, email, telefone, data_admissao,
+                           tipo_contrato, unidade, senha_hash, perfil, status, ultimo_acesso, foto)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'usuario','trocar_senha',%s,NULL)
                         """,
                         (
@@ -317,32 +327,33 @@ def gerenciar_funcionarios():
                     )
                 conn.commit()
             st.success("Funcionários importados com sucesso!")
-            st.session_state.pop("up", None)
+            st.session_state["up"] = False
             st.rerun()
 
-    # Listagem, filtro e ações
+    # ---------- Lista com filtro + ações ----------
     st.markdown("<hr style='margin-top:10px;margin-bottom:20px;'>", unsafe_allow_html=True)
     st.markdown("### 👥 Funcionários cadastrados")
     filtro = st.text_input("Filtrar por nome, matrícula, cargo ou unidade")
 
     with conectar_banco() as conn, conn.cursor() as c:
-        c.execute("SELECT id, nome, matricula, unidade, cargo FROM funcionarios")
+        c.execute("SELECT id, nome, matricula, unidade, cargo FROM funcionarios ORDER BY nome ASC")
         all_funcs = c.fetchall()
 
-    if filtro:
-        filtro_low = filtro.lower()
-        funcs = [f for f in all_funcs if filtro_low in " ".join([str(x) for x in f]).lower()]
-    else:
-        funcs = all_funcs
+    funcs = (
+        [f for f in all_funcs if (filtro or "").lower() in " ".join([str(x) for x in f]).lower()]
+        if filtro else all_funcs
+    )
 
+    # cabeçalho
     cols = st.columns([3, 2, 2, 1, 1])
     for col, title in zip(cols, ["Nome", "Cargo", "Unidade", "Editar", "Excluir"]):
         col.markdown(f"**{title}**")
     st.markdown("<hr style='margin:0 0 10px 0;'>", unsafe_allow_html=True)
 
+    # linhas
     for fid, nome, mat, uni, carg in funcs:
         row_cols = st.columns([3, 2, 2, 1, 1])
-        row_cols[0].markdown(f"**{nome}**\n`{mat}`")
+        row_cols[0].markdown(f"**{nome or ''}**\n`{mat or ''}`")
         row_cols[1].markdown(carg or "")
         row_cols[2].markdown(uni or "")
         if row_cols[3].button("✏️", key=f"edit-{fid}"):
