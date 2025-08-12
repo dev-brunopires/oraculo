@@ -9,26 +9,15 @@ except Exception:
     st = None
 
 import socket
+import ssl
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- Garante psycopg instalado antes de importar submódulos ---
-# garante psycopg instalado (fallback, só para destravar)
-try:
-    import psycopg
-except Exception:
-    import sys, subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg-binary==3.2.1"])
-    import psycopg
-
-try:
-    from psycopg.rows import tuple_row
-except Exception:
-    tuple_row = None
-
-
+# ---- driver Postgres: pg8000 (100% Python) ----
+import pg8000
+from urllib.parse import urlsplit
 # ------------------ Sanitização e obtenção da URL ------------------
 def _sanitize_neon_url(raw: str) -> str:
     """
@@ -108,9 +97,16 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ===================== Conexão =====================
 def conectar_banco():
-    if tuple_row:
-        return psycopg.connect(PG_URL, row_factory=tuple_row)
-    return psycopg.connect(PG_URL)
+    parts = urlsplit(PG_URL)  # ex.: postgresql://user:pass@host:port/db?sslmode=require
+    return pg8000.connect(
+        user=parts.username,
+        password=parts.password,
+        host=parts.hostname,
+        port=parts.port or 5432,
+        database=parts.path.lstrip("/"),
+        ssl_context=ssl.create_default_context(),  # Neon exige SSL
+        timeout=30,
+    )
 # ===================== Inicialização com FTS (Postgres) =====================
 def inicializa_banco():
     """
@@ -440,6 +436,7 @@ def buscar_procedimentos_prior_descricao(
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 
     return rows
+
 
 
 
