@@ -11,11 +11,19 @@ except Exception:
 import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import tuple_row
 
 load_dotenv()
+
+# Fallback: instala psycopg-binary se faltar (apenas no Cloud, temporário)
+try:
+    import psycopg  # noqa
+except Exception:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg-binary==3.2.1"])
+    import psycopg  # noqa
 
 # ------------------ Sanitização e obtenção da URL ------------------
 def _sanitize_neon_url(raw: str) -> str:
