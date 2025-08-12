@@ -15,19 +15,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Garante psycopg instalado antes de importar submódulos ---
+# garante psycopg instalado (fallback, só para destravar)
 try:
-    import psycopg  # v3
+    import psycopg
 except Exception:
-    # fallback (temporário) para o Cloud, caso ignore o requirements
     import sys, subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg-binary==3.2.1"])
     import psycopg
 
-# tuple_row é opcional dependendo do wheel
 try:
     from psycopg.rows import tuple_row
 except Exception:
     tuple_row = None
+
 
 # ------------------ Sanitização e obtenção da URL ------------------
 def _sanitize_neon_url(raw: str) -> str:
@@ -107,11 +107,10 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ===================== Conexão =====================
-def conectar_banco() -> "psycopg.Connection":
-    if tuple_row is not None:
+def conectar_banco():
+    if tuple_row:
         return psycopg.connect(PG_URL, row_factory=tuple_row)
     return psycopg.connect(PG_URL)
-
 # ===================== Inicialização com FTS (Postgres) =====================
 def inicializa_banco():
     """
@@ -441,5 +440,6 @@ def buscar_procedimentos_prior_descricao(
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 
     return rows
+
 
 
