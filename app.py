@@ -42,7 +42,7 @@ from login import exibir_login, exibir_trocar_senha, exibir_usuarios
 # from neworaculo import pagina_neworaculo
 
 # Modelo default
-MODELO_PADRAO = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODELO_PADRAO = "llama-3.1-8b-instant"
 MEMORIA = ConversationBufferMemory()
 inicializa_banco()
 
