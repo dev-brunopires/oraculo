@@ -6,11 +6,12 @@ st.set_page_config(page_title="Oráculo", layout="wide")
 import base64
 import os
 import re
-import sqlite3
 import time
 from textwrap import dedent
 
 from dotenv import load_dotenv
+
+from db import conectar_banco
 
 # ===================== CONFIGURAÇÃO DE CHAVES =====================
 load_dotenv()  # carrega variáveis do .env
@@ -58,18 +59,29 @@ def stream_with_retry(chain, args, max_retries=3):
 
 # ===================== PEGAR FOTO DO USUÁRIO =====================
 def obter_foto_usuario(email: str) -> str:
-    conn = sqlite3.connect("oraculo.db"); c = conn.cursor()
-    c.execute("SELECT foto FROM funcionarios WHERE email = ?", (email,))
-    resultado = c.fetchone(); conn.close()
-    if resultado and resultado[0]:
-        caminho = resultado[0]
-        if caminho.startswith("http"):
-            return caminho
-        if os.path.exists(caminho):
-            ext = os.path.splitext(caminho)[1].lower().lstrip('.') or 'png'
-            with open(caminho, "rb") as img_f:
-                b64 = base64.b64encode(img_f.read()).decode()
-            return f"data:image/{ext};base64,{b64}"
+    # Busca foto na coluna BYTEA (usuarios.foto). Se for URL salva em texto, também aceita.
+    try:
+        with conectar_banco() as conn, conn.cursor() as c:
+            c.execute("SELECT foto FROM usuarios WHERE email = %s", (email.lower(),))
+            row = c.fetchone()
+    except Exception:
+        row = None
+
+    if row and row[0]:
+        blob = row[0]
+        # Se estiver salvo como URL em texto
+        if isinstance(blob, str) and blob.startswith(("http://", "https://")):
+            return blob
+        # Caso típico: BYTEA -> bytes
+        try:
+            b = bytes(blob)
+        except Exception:
+            b = blob  # já é bytes
+        b64 = base64.b64encode(b).decode()
+        # Sem MIME salvo, assuma png (ou troque para jpeg se preferir)
+        return f"data:image/png;base64,{b64}"
+
+    # fallback: imagem padrão do projeto
     default_path = "img/circle-user.png"
     if os.path.exists(default_path):
         ext = os.path.splitext(default_path)[1].lower().lstrip('.') or 'png'
@@ -112,14 +124,24 @@ if usuario.get("status") == "trocar_senha":
 
 # ===================== IDIOMA =====================
 def obter_idioma_usuario() -> str:
-    conn = sqlite3.connect("oraculo.db"); c = conn.cursor()
+    # Se tiver coluna 'idioma' (pt/en) ou 'estrangeiro' (bool), usa; senão, default 'pt'
     try:
-        c.execute("SELECT estrangeiro FROM funcionarios WHERE email = ?", (usuario["email"],))
-        resultado = c.fetchone()
-    except sqlite3.OperationalError:
-        resultado = None
-    conn.close()
-    return 'en' if resultado and resultado[0] == 1 else 'pt'
+        with conectar_banco() as conn, conn.cursor() as c:
+            # tente ler 'idioma' (ex.: 'pt'/'en')
+            c.execute("SELECT idioma FROM usuarios WHERE email = %s", (usuario["email"].lower(),))
+            row = c.fetchone()
+            if row and row[0]:
+                val = str(row[0]).strip().lower()
+                if val in ("pt", "en"):
+                    return val
+            # fallback: tente 'estrangeiro' (true => 'en')
+            c.execute("SELECT estrangeiro FROM usuarios WHERE email = %s", (usuario["email"].lower(),))
+            row = c.fetchone()
+            if row and (row[0] in (1, True, "1", "t", "true", "True")):
+                return "en"
+    except Exception:
+        pass
+    return "pt"
 
 if "idioma" not in st.session_state:
     st.session_state["idioma"] = obter_idioma_usuario()
