@@ -107,9 +107,10 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ===================== Conexão =====================
-def conectar_banco() -> psycopg.Connection:
-    """Retorna conexão Postgres (Neon)."""
-    return psycopg.connect(PG_URL, row_factory=tuple_row)
+def conectar_banco() -> "psycopg.Connection":
+    if tuple_row is not None:
+        return psycopg.connect(PG_URL, row_factory=tuple_row)
+    return psycopg.connect(PG_URL)
 
 # ===================== Inicialização com FTS (Postgres) =====================
 def inicializa_banco():
@@ -440,4 +441,5 @@ def buscar_procedimentos_prior_descricao(
         rows = [(t, c[:truncate_chars]) for t, c in rows]
 
     return rows
+
 
